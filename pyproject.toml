@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bb-cc-proxy"
+version = "0.1.0"
+description = "Local decrypting proxy for confidential (E2E-encrypted) model endpoints"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "flask>=3.0",
+    "requests>=2.31",
+    "cryptography>=42.0",
+    "pyjwt>=2.8",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+bb-cc-proxy = "cc_proxy.__main__:main"
+
+[tool.setuptools]
+packages = ["cc_proxy"]
