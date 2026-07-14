@@ -70,6 +70,11 @@ class ConfidentialSession:
         self._local_priv = None
         self._local_pub = None
         self._session_id = None  # supplied by /attestation on supervisors that use it
+        # Wire protocol mode. Newer workers accept a full ``{path, method, body}``
+        # envelope (preserves tool_calls / usage / finish_reason). Some older
+        # workers only accept a bare messages array. We start optimistic and
+        # auto-downgrade on the first HTTP 500 from an envelope attempt.
+        self._wire = "envelope"  # "envelope" | "legacy"
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -255,21 +260,124 @@ class ConfidentialSession:
                 pass
         return reply
 
+    def _wrap_legacy_reply(self, reply, body: dict) -> dict:
+        """Wrap a legacy worker reply into an OpenAI ``chat.completion`` dict.
+
+        ``reply`` may be:
+          * bare assistant text (older workers, envelope-fallback text) — wrapped as ``content``
+          * a JSON string encoding ``{"content": "...", "tool_calls": [...]}``
+            (nemotron-49b when tools are engaged) — surfaced with proper
+            ``tool_calls[]`` and ``finish_reason="tool_calls"``
+        """
+        model_id = body.get("model") or self.model or "encrypted-model"
+        text = self._extract_text(reply) if not isinstance(reply, str) else reply
+
+        # Try to parse a structured {content, tool_calls} reply.
+        parsed = None
+        if isinstance(text, str) and text.lstrip().startswith("{"):
+            try:
+                candidate = json.loads(text)
+                if isinstance(candidate, dict) and ("tool_calls" in candidate or "content" in candidate):
+                    parsed = candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if parsed and isinstance(parsed.get("tool_calls"), list) and parsed["tool_calls"]:
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": parsed.get("content") or None,
+                        "tool_calls": parsed["tool_calls"],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+
+        # Fall through: bare content (either extracted from parsed dict or raw text)
+        content = parsed.get("content") if parsed else text
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_id,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    def _send_openai_legacy(self, body: dict, *, api_key_override: str = None) -> tuple:
+        """Legacy transport: send a bare messages array (no envelope, no path
+        routing, no tool_calls / usage / finish_reason preservation). Used
+        automatically when the worker rejects the ``{path, method, body}``
+        envelope with HTTP 500.
+        """
+        # Send the full OpenAI body as a bare dict (no {path,method,body} envelope).
+        # The nemotron-49b enclave accepts this shape and returns proper tool_calls;
+        # older workers that predate tools still accept it and return bare text.
+        payload = {k: v for k, v in body.items() if k != "stream"}
+        resp = self._post_message(payload, stream=False, api_key_override=api_key_override)
+        if resp.status_code >= 400:
+            try:
+                err_body = resp.json()
+            except ValueError:
+                err_body = {"error": {"message": resp.text[:500]}}
+            return resp.status_code, err_body
+        try:
+            reply = crypto.decrypt_and_verify(resp.json(), self._shared_key, self._supervisor_pub)
+        except (ValueError, KeyError) as e:
+            return 502, {"error": {"message": f"failed to decrypt reply: {e}"}}
+        return 200, self._wrap_legacy_reply(reply, body)
+
     def send_openai(self, body: dict, *, path: str = "/v1/chat/completions",
                     api_key_override: str = None) -> tuple:
         """Send a full OpenAI request body via the supervisor.
 
         ``path`` selects the upstream route (e.g. ``/v1/responses``).
         Returns ``(status_code, response_dict)``.
+
+        Some older workers only accept a bare messages array (no
+        ``{path, method, body}`` envelope). If the envelope attempt returns
+        HTTP 500 we auto-downgrade the session to legacy mode and retry once;
+        subsequent requests skip the envelope attempt entirely.
         """
         if not self._connected:
             raise RuntimeError("session not connected")
+
+        # Legacy mode: skip the envelope, it's known to 500 for this worker.
+        # Only chat/completions has a legacy fallback — /v1/responses etc. only
+        # ever worked on new workers, so we can't downgrade those.
+        if self._wire == "legacy" and path == "/v1/chat/completions":
+            return self._send_openai_legacy(body, api_key_override=api_key_override)
 
         # Send the FULL OpenAI body (messages + tools + tool_choice + sampling …)
         # in a {path, body} envelope so the worker forwards it verbatim to vLLM
         # and tool_calls / usage / finish_reason survive end-to-end.
         envelope = {"path": path, "method": "POST", "body": body}
         resp = self._post_message(envelope, stream=False, api_key_override=api_key_override)
+        if resp.status_code == 500 and path == "/v1/chat/completions":
+            # Likely a legacy worker rejecting the envelope. Downgrade the
+            # session and retry once with the bare messages array.
+            logger.warning(
+                "worker returned 500 to envelope; downgrading session to legacy "
+                "wire protocol (usage token counts will be zero) — %s",
+                self.model,
+            )
+            self._wire = "legacy"
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return self._send_openai_legacy(body, api_key_override=api_key_override)
         if resp.status_code >= 400:
             try:
                 err_body = resp.json()
@@ -295,21 +403,7 @@ class ConfidentialSession:
                 return 200, obj
 
         # Legacy worker: reply is bare assistant text — wrap it OpenAI-style.
-        text = self._extract_text(reply)
-        model_id = body.get("model") or self.model or "encrypted-model"
-        wrapped = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model_id,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        }
-        return 200, wrapped
+        return 200, self._wrap_legacy_reply(self._extract_text(reply), body)
 
     def stream_openai(self, body: dict, *, path: str = "/v1/chat/completions",
                       api_key_override: str = None):
@@ -318,12 +412,14 @@ class ConfidentialSession:
         ``path`` selects the upstream route (e.g. ``/v1/responses``).
         Yields raw JSON strings (without the ``data: `` SSE prefix — the
         server layer adds that).
+
+        On HTTP 500 from the envelope (legacy worker), auto-downgrades the
+        session to bare-messages-array mode and retries once. The per-frame
+        loop below already handles both structured (new) and bare-text (legacy)
+        chunk shapes, so no other stream-side changes are needed.
         """
         if not self._connected:
             raise RuntimeError("session not connected")
-        # Send the full body so the worker streams real OpenAI chunks (which
-        # carry delta.tool_calls and finish_reason) back to us.
-        envelope = {"path": path, "method": "POST", "body": body}
         model_id = body.get("model") or self.model or "encrypted-model"
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
@@ -337,11 +433,38 @@ class ConfidentialSession:
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             })
 
+        def _post_envelope():
+            envelope = {"path": path, "method": "POST", "body": body}
+            return self._post_message(envelope, stream=True, api_key_override=api_key_override)
+
+        def _post_legacy():
+            # Same shape as _send_openai_legacy: full body dict (minus stream flag,
+            # which is carried in the URL leaf). Enclaves that support tools in the
+            # legacy dict will now stream tool_calls chunks; older workers still
+            # receive a valid messages+... payload and return bare text as before.
+            payload = {k: v for k, v in body.items() if k != "stream"}
+            return self._post_message(payload, stream=True,
+                                      api_key_override=api_key_override)
+
         # Fire the upstream request BEFORE yielding the opening role frame,
         # so that HTTP-level failures (4xx) and the very first streamed frame
         # (which may itself be a plaintext ``{"error": ...}`` from the worker)
         # can surface as a clean HTTP status instead of a mid-stream error.
-        resp = self._post_message(envelope, stream=True, api_key_override=api_key_override)
+        if self._wire == "legacy" and path == "/v1/chat/completions":
+            resp = _post_legacy()
+        else:
+            resp = _post_envelope()
+            if resp.status_code == 500 and path == "/v1/chat/completions":
+                logger.warning(
+                    "worker returned 500 to envelope on stream; downgrading session "
+                    "to legacy wire protocol (usage token counts will be zero) — %s", self.model,
+                )
+                self._wire = "legacy"
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                resp = _post_legacy()
         if resp.status_code >= 400:
             try:
                 err_body = resp.json()
