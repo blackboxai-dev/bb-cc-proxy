@@ -33,6 +33,27 @@ import requests
 from . import crypto
 
 logger = logging.getLogger("cc_proxy.session")
+wire_logger = logging.getLogger("cc_proxy.wire")
+
+
+def _preview_enc(obj, limit: int) -> str:
+    """JSON-stringify an encrypted envelope and middle-truncate the whole line.
+
+    ``obj`` is either the outbound envelope ({peer_public_key, payload, ...}),
+    a response payload dict, or the trailing ``{"eos": true}`` frame. Truncation
+    keeps head + tail so nonce/iv/signature stay visible while the long
+    ciphertext middle is collapsed. ``limit <= 0`` disables truncation.
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        s = repr(obj)
+    if limit and limit > 0 and len(s) > limit:
+        head = limit // 2
+        tail = limit - head
+        omitted = len(s) - limit
+        return f"{s[:head]}…[{omitted} chars omitted]…{s[-tail:]}"
+    return s
 
 
 class AttestationError(RuntimeError):
@@ -52,7 +73,9 @@ class ConfidentialSession:
     def __init__(self, enc_endpoint: str, model: str, *,
                  insecure_skip_attest: bool = False,
                  timeout: float = 120.0, verify_tls: bool = True,
-                 api_key: str = None):
+                 api_key: str = None,
+                 log_encrypted: bool = False,
+                 log_encrypted_max: int = 512):
         if not model:
             raise ValueError("model is required, e.g. 'google/gemma-4-31b-it'")
         self.enc_endpoint = enc_endpoint.rstrip("/")
@@ -61,6 +84,11 @@ class ConfidentialSession:
         self.timeout = timeout
         self.verify_tls = verify_tls
         self.api_key = api_key
+        # Encrypted-wire logging (debug flag; only ciphertext envelope is logged,
+        # never plaintext). log_encrypted_max middle-truncates the ciphertext
+        # preview per line; 0 disables truncation.
+        self.log_encrypted = log_encrypted
+        self.log_encrypted_max = log_encrypted_max
 
         self._lock = threading.Lock()
         self._nonce = 1000
@@ -175,6 +203,21 @@ class ConfidentialSession:
 
     # -- transport ---------------------------------------------------------
 
+    def _log_enc(self, direction: str, url: str, obj) -> None:
+        """Emit one encrypted-wire log line. No-op unless log_encrypted is on.
+
+        direction: '→' outbound (proxy → worker) or '←' inbound.
+        Only the encrypted envelope (nonce/iv/ciphertext/signature) is logged.
+        """
+        if not self.log_encrypted:
+            return
+        try:
+            wire_logger.info(
+                "%s %s %s", direction, url, _preview_enc(obj, self.log_encrypted_max)
+            )
+        except Exception:  # noqa: BLE001 — logging must never break transport
+            pass
+
     def _post_message(self, payload, *, stream: bool, api_key_override: str = None):
         """POST to /message or /message_stream.
 
@@ -190,6 +233,7 @@ class ConfidentialSession:
 
         for attempt in range(2):
             body = self._request_body(json.dumps(payload))
+            self._log_enc("→", url, body)
             resp = requests.post(
                 url,
                 json=body,
@@ -206,6 +250,14 @@ class ConfidentialSession:
                     pass
                 self.connect()
                 continue
+            # For non-stream responses, log the encrypted response body once
+            # here. Streaming responses are logged per-line inside the
+            # callers' iter_lines() loops (see stream_openai / stream).
+            if not stream and self.log_encrypted and resp.status_code < 400:
+                try:
+                    self._log_enc("←", url, resp.json())
+                except ValueError:
+                    pass
             return resp
         return resp  # pragma: no cover (loop always returns)
 
@@ -234,6 +286,7 @@ class ConfidentialSession:
                 if not line:
                     continue
                 chunk = json.loads(line)
+                self._log_enc("←", resp.url, chunk)
                 if isinstance(chunk, dict) and chunk.get("eos"):
                     break
                 if isinstance(chunk, dict) and "error" in chunk:
@@ -472,7 +525,18 @@ class ConfidentialSession:
                 err_body = {"error": {"message": resp.text[:500]}}
             raise UpstreamStreamError(resp.status_code, err_body)
 
-        line_iter = resp.iter_lines()
+        # Tap encrypted stream frames as they arrive (no-op unless
+        # log_encrypted is set).
+        _resp_url = resp.url
+        def _logged_iter_lines():
+            for raw in resp.iter_lines():
+                if raw and self.log_encrypted:
+                    try:
+                        self._log_enc("←", _resp_url, json.loads(raw))
+                    except (ValueError, TypeError):
+                        pass
+                yield raw
+        line_iter = _logged_iter_lines()
 
         def _next_nonempty():
             for raw in line_iter:

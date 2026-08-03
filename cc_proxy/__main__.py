@@ -50,6 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "(gemma/llama/nemotron/deepseek/minimax/qwen/openai), a HF repo id "
                         "(org/name), a local tokenizer file path, or `tiktoken:<encoding>`. "
                         "Auto-detected from --model when omitted.")
+    p.add_argument("--log-encrypted", action="store_true",
+                   help="Log the encrypted (AES-GCM) request/response envelopes exchanged "
+                        "with the worker under the `cc_proxy.wire` logger. Covers "
+                        "streaming + non-streaming. Only ciphertext is logged — no plaintext.")
+    p.add_argument("--log-encrypted-max", type=int, default=512,
+                   help="Max chars per encrypted-wire log line before middle-truncation "
+                        "(default: 512, 0 = no truncation)")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return p
 
@@ -70,6 +77,11 @@ def main(argv=None) -> int:
         log.info("--passthrough-api-key: no default upstream key configured; every request "
                  "must include Authorization: Bearer <sk-...>")
 
+    if args.log_encrypted:
+        log.info("--log-encrypted ON: AES-GCM envelopes to/from the worker will be "
+                 "logged under `cc_proxy.wire` (ciphertext only, no plaintext), "
+                 "truncated to %d chars per line.", args.log_encrypted_max)
+
     session = ConfidentialSession(
         args.enc_endpoint,
         args.model,
@@ -77,6 +89,8 @@ def main(argv=None) -> int:
         timeout=args.timeout,
         verify_tls=not args.no_verify_tls,
         api_key=args.upstream_api_key,
+        log_encrypted=args.log_encrypted,
+        log_encrypted_max=args.log_encrypted_max,
     )
     try:
         session.connect()
