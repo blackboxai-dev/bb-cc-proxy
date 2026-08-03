@@ -11,6 +11,7 @@ import sys
 
 from .server import create_app
 from .session import AttestationError, ConfidentialSession
+from . import tokens as _tokens
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +39,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--passthrough-api-key", action="store_true",
                    help="Forward the client's Authorization: Bearer header upstream verbatim "
                         "(BYO-key). Falls back to --upstream-api-key when the client sends no token.")
+    p.add_argument("--count-tokens", action="store_true",
+                   help="Log per-request token counts to the `cc_proxy.tokens` logger "
+                        "and always emit the OpenAI streaming usage terminal frame "
+                        "(even when the client didn't set stream_options.include_usage). "
+                        "Off by default. Response `usage` blocks are populated "
+                        "automatically whenever a tokenizer is available.")
+    p.add_argument("--tokenizer", default=None,
+                   help="Tokenizer spec: family name "
+                        "(gemma/llama/nemotron/deepseek/minimax/qwen/openai), a HF repo id "
+                        "(org/name), a local tokenizer file path, or `tiktoken:<encoding>`. "
+                        "Auto-detected from --model when omitted.")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return p
 
@@ -76,11 +88,25 @@ def main(argv=None) -> int:
         log.error("could not establish confidential session: %s", e)
         return 1
 
+    # Always try to load a tokenizer so `usage` blocks can be populated
+    # opportunistically (Anthropic spec requires them; OpenAI clients that
+    # set stream_options.include_usage=true expect them). --count-tokens
+    # only turns on logging + always-emit-on-stream.
+    tokenizer = _tokens.load(args.tokenizer, model_hint=args.model)
+    if args.count_tokens:
+        log.info("token counting ON — tokenizer=%s (source=%s)",
+                 tokenizer.name, tokenizer.source)
+    else:
+        log.debug("tokenizer loaded silently: %s (source=%s)",
+                  tokenizer.name, tokenizer.source)
+
     app = create_app(
         session,
         args.model,
         local_api_key=args.local_api_key,
         passthrough_api_key=args.passthrough_api_key,
+        tokenizer=tokenizer,
+        log_tokens=args.count_tokens,
     )
     log.info("serving OpenAI (/v1/chat/completions) + Anthropic (/v1/messages) on "
              "http://%s:%d  ->  %s%s", args.host, args.port, args.enc_endpoint,

@@ -18,6 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+tokens = ["tokenizers>=0.15"]
+tokens-tiktoken = ["tiktoken>=0.7"]
 
 [project.scripts]
 bb-cc-proxy = "cc_proxy.__main__:main"

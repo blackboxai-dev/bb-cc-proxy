@@ -10,12 +10,71 @@ and translated back.
 """
 
 import json
+import logging
+import time
 import uuid
 
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
 
 from .session import ConfidentialSession, UpstreamStreamError
+
+
+tokens_logger = logging.getLogger("cc_proxy.tokens")
+
+
+# The upstream worker can't tokenize an encrypted payload, so any `usage` it
+# might return is unreliable — we treat this proxy as the sole source of truth
+# for token counts and always overwrite when a tokenizer is available.
+
+
+def _inject_usage_openai(rbody, in_toks: int, out_toks: int):
+    if not isinstance(rbody, dict):
+        return
+    rbody["usage"] = {
+        "prompt_tokens": in_toks,
+        "completion_tokens": out_toks,
+        "total_tokens": in_toks + out_toks,
+    }
+
+
+def _inject_usage_responses(rbody, in_toks: int, out_toks: int):
+    if not isinstance(rbody, dict):
+        return
+    rbody["usage"] = {
+        "input_tokens": in_toks,
+        "output_tokens": out_toks,
+        "total_tokens": in_toks + out_toks,
+    }
+
+
+def _log_tokens(endpoint: str, in_toks: int, out_toks: int):
+    tokens_logger.info("%s in=%d out=%d", endpoint, in_toks, out_toks)
+
+
+def _client_asked_for_usage(body) -> bool:
+    """True if the OpenAI request set `stream_options.include_usage=true`."""
+    if not isinstance(body, dict):
+        return False
+    so = body.get("stream_options")
+    return isinstance(so, dict) and bool(so.get("include_usage"))
+
+
+def _usage_stream_frame(chunk_id: str, model: str, created: int,
+                        in_toks: int, out_toks: int) -> str:
+    """The terminal SSE frame OpenAI clients read when stream_options.include_usage=true."""
+    return json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": in_toks,
+            "completion_tokens": out_toks,
+            "total_tokens": in_toks + out_toks,
+        },
+    })
 
 
 # ------------------ Anthropic <-> OpenAI translation ------------------
@@ -234,6 +293,8 @@ def create_app(
     *,
     local_api_key: str = None,
     passthrough_api_key: bool = False,
+    tokenizer=None,
+    log_tokens: bool = False,
 ) -> Flask:
     """Build the Flask app.
 
@@ -243,6 +304,14 @@ def create_app(
     ``passthrough_api_key`` — when True, the bearer token on each incoming
         request is forwarded upstream verbatim (BYO-key). ``session.api_key``
         remains as a fallback default if the client sent no token.
+    ``tokenizer`` — optional ``cc_proxy.tokens.Tokenizer``. When provided,
+        every response's ``usage`` block is populated locally (the encrypted
+        upstream can't tokenize the payload). The tokenizer is used
+        opportunistically on any request; ``log_tokens`` only controls
+        logging and always-emit-on-stream behavior.
+    ``log_tokens`` — when True, log one ``cc_proxy.tokens`` INFO line per
+        request and always emit the OpenAI streaming usage terminal frame
+        (even without client-side ``stream_options.include_usage``).
     """
     app = Flask(__name__)
 
@@ -292,6 +361,9 @@ def create_app(
     @app.post("/v1/chat/completions")
     def chat_completions():
         body = request.get_json(force=True)
+        in_toks = tokenizer.count_messages(body.get("messages"), body.get("tools")) \
+            if tokenizer else 0
+        client_wants_usage = _client_asked_for_usage(body)
         if body.get("stream"):
             gen = session.stream_openai(body, api_key_override=_client_override())
             # Peek the first frame so an upstream error (e.g. tool-choice 400) or a
@@ -306,23 +378,64 @@ def create_app(
             except requests.RequestException as e:
                 return jsonify({"error": {"message": f"upstream connection failed: {e}"}}), 502
 
+            emit_usage_frame = bool(tokenizer) and (log_tokens or client_wants_usage)
+
             def stream():
+                collected = [] if tokenizer else None
+                chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+
+                def _collect(raw):
+                    if collected is None:
+                        return
+                    try:
+                        collected.append(json.loads(raw))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
                 if first is not None:
+                    _collect(first)
                     yield f"data: {first}\n\n"
                 try:
                     for chunk in gen:
+                        _collect(chunk)
                         yield f"data: {chunk}\n\n"
                 except (UpstreamStreamError, requests.RequestException) as e:
                     err = getattr(e, "body", None) or {"error": {"message": str(e)}}
                     yield f"data: {json.dumps(err)}\n\n"
+                if tokenizer:
+                    try:
+                        for c in collected or []:
+                            if isinstance(c, dict):
+                                chunk_id = c.get("id") or chunk_id
+                                created = c.get("created") or created
+                                break
+                        model = body.get("model") or model_name
+                        out_toks = tokenizer.count_stream_chunks(collected)
+                        if emit_usage_frame:
+                            yield f"data: {_usage_stream_frame(chunk_id, model, created, in_toks, out_toks)}\n\n"
+                        if log_tokens:
+                            _log_tokens("/v1/chat/completions (stream)", in_toks, out_toks)
+                    except Exception:  # noqa: BLE001
+                        pass
                 yield "data: [DONE]\n\n"
             return Response(stream_with_context(stream()), mimetype="text/event-stream")
         status, rbody = session.send_openai(body, api_key_override=_client_override())
+        if tokenizer and status == 200:
+            try:
+                out_toks = tokenizer.count_openai_response(rbody)
+                _inject_usage_openai(rbody, in_toks, out_toks)
+                if log_tokens:
+                    _log_tokens("/v1/chat/completions", in_toks, out_toks)
+            except Exception:  # noqa: BLE001
+                pass
         return jsonify(rbody), status
 
     @app.post("/v1/responses")
     def responses():
         body = _normalize_responses_input(request.get_json(force=True))
+        in_toks = tokenizer.count_messages(body.get("input"), body.get("tools")) \
+            if tokenizer else 0
         if body.get("stream"):
             gen = session.stream_openai(body, path="/v1/responses",
                                         api_key_override=_client_override())
@@ -345,10 +458,23 @@ def create_app(
                 except (UpstreamStreamError, requests.RequestException) as e:
                     err = getattr(e, "body", None) or {"error": {"message": str(e)}}
                     yield f"data: {json.dumps(err)}\n\n"
+                # Responses-API stream events have their own schema — no
+                # synthesized usage event (would risk breaking downstream
+                # parsers). Log-only.
+                if tokenizer and log_tokens:
+                    _log_tokens("/v1/responses (stream)", in_toks, 0)
                 yield "data: [DONE]\n\n"
             return Response(stream_with_context(stream()), mimetype="text/event-stream")
         status, rbody = session.send_openai(body, path="/v1/responses",
                                             api_key_override=_client_override())
+        if tokenizer and status == 200:
+            try:
+                out_toks = tokenizer.count_openai_response(rbody)
+                _inject_usage_responses(rbody, in_toks, out_toks)
+                if log_tokens:
+                    _log_tokens("/v1/responses", in_toks, out_toks)
+            except Exception:  # noqa: BLE001
+                pass
         return jsonify(rbody), status
 
     @app.post("/v1/messages")
@@ -360,6 +486,18 @@ def create_app(
         if status != 200:
             return jsonify({"type": "error",
                             "error": {"type": "api_error", "message": str(rbody)}}), status
+        if tokenizer:
+            # Anthropic spec requires a usage block on every message response
+            # (non-stream and stream). Inject into rbody so the mapper picks
+            # up the local count.
+            try:
+                in_toks = tokenizer.count_messages(oai.get("messages"), oai.get("tools"))
+                out_toks = tokenizer.count_openai_response(rbody)
+                _inject_usage_openai(rbody, in_toks, out_toks)
+                if log_tokens:
+                    _log_tokens("/v1/messages", in_toks, out_toks)
+            except Exception:  # noqa: BLE001
+                pass
         msg = openai_to_anthropic_message(rbody, model_name)
         if not body.get("stream"):
             return jsonify(msg)

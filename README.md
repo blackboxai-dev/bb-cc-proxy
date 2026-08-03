@@ -52,6 +52,43 @@ Useful flags:
 | `--local-api-key` | require a bearer token from your CLI to the proxy |
 | `--no-verify-tls` | skip TLS verification to the worker (self-signed cert) |
 | `--insecure-skip-attestation` | **testing only** — skip GPU attestation (non-CC worker) |
+| `--count-tokens` | enable per-request logging (`cc_proxy.tokens` INFO) and always emit the OpenAI streaming usage frame. Off by default. Usage blocks are still populated automatically whenever a client asks for them (see below) |
+| `--tokenizer` | tokenizer spec: family name (`gemma`, `llama`, `nemotron`, `deepseek`, `minimax`, `qwen`, `openai`), HF repo id (`org/name`), local file path, or `tiktoken:<encoding>`. Auto-detected from `--model` when omitted |
+
+### Token counting & usage reporting
+
+The encrypted worker can't decrypt the payload it forwards, so it can't
+tokenize it either — this proxy is the sole source of truth for token counts.
+A tokenizer is loaded silently at startup (auto-detected from `--model`) so
+that response `usage` blocks can be populated whenever the client protocol
+expects them:
+
+| Trigger | Non-stream response `usage` | Streaming usage frame | Log line |
+|---|---|---|---|
+| Any `/v1/messages` request (Anthropic — spec requires usage) | ✅ populated | ✅ (in `message_start` + `message_delta`) | only with `--count-tokens` |
+| OpenAI request without `stream_options.include_usage` | ✅ populated | ❌ (spec-compliant OpenAI default) | only with `--count-tokens` |
+| OpenAI request with `stream_options.include_usage: true` | ✅ populated | ✅ terminal `{choices: [], usage: {…}}` frame | only with `--count-tokens` |
+| `--count-tokens` on | ✅ populated | ✅ always, regardless of client flag | ✅ every request |
+
+So CLIs that follow the OpenAI / Anthropic specs (Claude Code, aider, Codex,
+Continue, OpenClaw…) get correct token usage out of the box — no flag needed.
+`--count-tokens` is for operator debugging and for forcing the streaming usage
+frame on clients that don't set `include_usage`.
+
+Install the tokenizer backend:
+
+```
+pip install "bb-cc-proxy[tokens]"          # tokenizers (covers Gemma / Llama / DeepSeek / MiniMax / Qwen)
+pip install "bb-cc-proxy[tokens-tiktoken]" # tiktoken (OpenAI models + universal fallback)
+```
+
+The same tokenizer covers both the OpenAI (`/v1/chat/completions`, `/v1/responses`)
+and Anthropic (`/v1/messages`) endpoints — tokenization is a property of the
+underlying model, not the API shape. Add a new model family by appending one
+row to `TOKENIZER_FAMILIES` in `cc_proxy/tokens.py`. If no tokenizer backend
+is available (offline / uninstalled), the proxy falls back silently to
+`tiktoken` and then to a whitespace heuristic; usage will still be populated,
+just approximate.
 
 ## Point a CLI at it
 
